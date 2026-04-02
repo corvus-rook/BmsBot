@@ -5,11 +5,13 @@ Monitors BookMyShow for "Hail Mary" IMAX shows at PVR Koramangala
 on Friday April 3, 2026 and sends Telegram alerts when tickets open.
 
 Usage:
+    python3 monitor.py          # reads credentials from .env automatically
+    # or set env vars manually:
     export TELEGRAM_BOT_TOKEN="<your-bot-token>"
-    export TELEGRAM_CHAT_ID="<your-chat-id>"       # channel: @channelusername or numeric chat id
+    export TELEGRAM_CHAT_ID="<your-chat-id>"
     python3 monitor.py
 
-Optional env vars:
+Optional env vars / .env keys:
     CHECK_INTERVAL   - seconds between checks (default: 120)
     BMS_CITY_CODE    - BookMyShow city code (default: BANG)
 """
@@ -19,8 +21,31 @@ import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import requests
+
+
+# ---------------------------------------------------------------------------
+# Load .env file if present (no external dependency needed)
+# ---------------------------------------------------------------------------
+
+def _load_dotenv(path: str = ".env") -> None:
+    env_file = Path(__file__).parent / path
+    if not env_file.exists():
+        return
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+_load_dotenv()
+
 
 # ---------------------------------------------------------------------------
 # Configuration
