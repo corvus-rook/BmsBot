@@ -2,32 +2,41 @@
 """
 PVR Koramangala IMAX Ticket Availability Monitor
 Monitors BookMyShow for "Hail Mary" IMAX shows at PVR Koramangala
-on Friday April 3, 2026 and sends Telegram alerts when tickets open.
+and sends Telegram alerts when tickets open.
 
 Usage:
     python3 monitor.py          # reads credentials from .env automatically
-    # or set env vars manually:
+    # or export manually:
     export TELEGRAM_BOT_TOKEN="<your-bot-token>"
     export TELEGRAM_CHAT_ID="<your-chat-id>"
     python3 monitor.py
 
-Optional env vars / .env keys:
-    CHECK_INTERVAL   - seconds between checks (default: 120)
-    BMS_CITY_CODE    - BookMyShow city code (default: BANG)
+.env / env vars:
+    TELEGRAM_BOT_TOKEN  - Telegram bot token from @BotFather
+    TELEGRAM_CHAT_ID    - chat/channel/group ID to send alerts to
+    CHECK_INTERVAL      - seconds between checks (default: 120)
+    TARGET_DATE         - YYYYMMDD date to check (default: 20260403)
+    BMS_CITY_CODE       - BookMyShow city code (default: BANG)
+
+NOTE: Requires 'cloudscraper' and 'beautifulsoup4' packages:
+    pip install cloudscraper beautifulsoup4
 """
 
+import json
 import logging
 import os
+import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
+import cloudscraper
 import requests
+from bs4 import BeautifulSoup
 
 
 # ---------------------------------------------------------------------------
-# Load .env file if present (no external dependency needed)
+# Load .env file if present (no python-dotenv dependency needed)
 # ---------------------------------------------------------------------------
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -52,34 +61,25 @@ _load_dotenv()
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "120"))   # seconds
+TARGET_DATE        = os.environ.get("TARGET_DATE", "20260403")       # default: Apr 3 2026
+CITY_CODE          = os.environ.get("BMS_CITY_CODE", "BANG")
 
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "120"))  # seconds
-
-# Target show details
-MOVIE_NAME_KEYWORDS = ["hail mary", "hailmary"]
+MOVIE_NAME_KEYWORDS   = ["hail mary", "hailmary"]
 TARGET_VENUE_KEYWORDS = ["pvr koramangala", "koramangala"]
 TARGET_FORMAT_KEYWORDS = ["imax"]
-TARGET_DATE = "20260403"         # YYYYMMDD — Friday April 3, 2026
-CITY_CODE = os.environ.get("BMS_CITY_CODE", "BANG")
-CITY_SLUG = "bengaluru"
 
-BMS_BASE = "https://in.bookmyshow.com"
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://in.bookmyshow.com/",
-        "X-Region-Code": CITY_CODE,
-        "X-Region-Slug": CITY_SLUG,
-    }
-)
+BMS_BASE  = "https://in.bookmyshow.com"
+BMS_CITY_SLUG = "bengaluru"
+
+# Human-readable date label for messages
+_DATE_LABELS = {
+    "20260402": "Wednesday, April 2, 2026",
+    "20260403": "Friday, April 3, 2026",
+}
+DATE_LABEL = _DATE_LABELS.get(TARGET_DATE, TARGET_DATE)
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,12 +95,55 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# CloudScraper session (handles Cloudflare JS challenges)
+# ---------------------------------------------------------------------------
+
+def _make_scraper() -> cloudscraper.CloudScraper:
+    sc = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    sc.headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+        "X-Region-Code": CITY_CODE,
+        "X-Region-Slug": BMS_CITY_SLUG,
+    })
+    return sc
+
+SCRAPER = _make_scraper()
+
+
+def _bms_get(path: str, params: dict | None = None, timeout: int = 25) -> dict | list | None:
+    """GET a BMS path; return parsed JSON or None on failure."""
+    url = f"{BMS_BASE}{path}"
+    try:
+        resp = SCRAPER.get(url, params=params, timeout=timeout)
+        if resp.status_code == 403:
+            log.debug("BMS 403 on %s — Cloudflare block (expected on server IPs)", path)
+            return None
+        resp.raise_for_status()
+        ct = resp.headers.get("content-type", "")
+        if "json" not in ct:
+            log.debug("Non-JSON response from %s: %s", path, ct)
+            return None
+        return resp.json()
+    except cloudscraper.exceptions.CloudflareChallengeError:
+        log.warning("Cloudflare challenge not solved for %s (server IP blocked)", path)
+    except requests.HTTPError as exc:
+        log.warning("HTTP error %s: %s", path, exc)
+    except requests.RequestException as exc:
+        log.warning("Request error %s: %s", path, exc)
+    except (ValueError, json.JSONDecodeError) as exc:
+        log.warning("JSON parse error %s: %s", path, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
 
-
 def send_telegram(message: str) -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
+    """Send a Telegram message. Returns True on success."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram credentials not set — skipping notification.")
         return False
@@ -123,300 +166,336 @@ def send_telegram(message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# BookMyShow API helpers
+# Strategy 1: BMS QUICKBOOK API
 # ---------------------------------------------------------------------------
 
-
-def _get(url: str, params: dict | None = None, timeout: int = 20) -> dict | list | None:
-    """GET a BMS endpoint; return parsed JSON or None on failure."""
+def _warm_session() -> None:
+    """Hit the BMS homepage once to get cookies before API calls."""
     try:
-        resp = SESSION.get(url, params=params, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.HTTPError as exc:
-        log.warning("HTTP error fetching %s: %s", url, exc)
-    except requests.RequestException as exc:
-        log.warning("Request error fetching %s: %s", url, exc)
-    except ValueError as exc:
-        log.warning("JSON parse error for %s: %s", url, exc)
-    return None
+        SCRAPER.get(f"{BMS_BASE}/{BMS_CITY_SLUG}/movies", timeout=20)
+    except Exception:
+        pass
 
 
-def fetch_now_showing_movies() -> list[dict]:
+def fetch_quickbook_shows() -> list[dict]:
     """
-    Fetch currently showing / upcoming movies for the configured city.
-    BMS exposes a movie list endpoint used by the website's home/explore pages.
+    Use the BMS QUICKBOOK endpoint to get all movies + venues for the city.
+    Returns a flat list of venue+show dicts for the target movie on TARGET_DATE.
     """
-    url = f"{BMS_BASE}/api/explore/v1/movies"
-    params = {
-        "appCode": "MOBAND2",
-        "appVersion": "14380",
-        "language": "en",
-        "status": "nowShowing,comingSoon",
-        "regionCode": CITY_CODE,
-        "city": "Bengaluru",
-    }
-    data = _get(url, params=params)
-    if isinstance(data, dict):
-        # Response is usually {"BookMyShow": {"arrEvents": [...]}}
-        movies = (
-            data.get("BookMyShow", {}).get("arrEvents")
-            or data.get("arrEvents")
-            or []
-        )
-        return movies if isinstance(movies, list) else []
-    return []
+    _warm_session()
+    data = _bms_get(
+        "/serv/getData",
+        params={
+            "cmd": "QUICKBOOK",
+            "appCode": "MOBAND2",
+            "appVersion": "14380",
+            "language": "en",
+            "regionCode": CITY_CODE,
+            "date": TARGET_DATE,
+        },
+    )
+    if not data:
+        return []
+
+    # Navigate the BMS nested response
+    # Typical shape: {"BookMyShow": {"arrEvents": [{"EventTitle":..., "Venues":[...]}]}}
+    root = data.get("BookMyShow") or data
+    events = root.get("arrEvents") or root.get("Events") or []
+    if not isinstance(events, list):
+        return []
+
+    results = []
+    for event in events:
+        title = (event.get("EventTitle") or event.get("EventName") or "").lower()
+        if not any(kw in title for kw in MOVIE_NAME_KEYWORDS):
+            continue
+        log.info("QUICKBOOK: found movie '%s'", event.get("EventTitle") or event.get("EventName"))
+        venues = event.get("Venues") or event.get("arrVenues") or []
+        for venue in venues:
+            vname = (venue.get("VenueName") or "").lower()
+            if not any(kw in vname for kw in TARGET_VENUE_KEYWORDS):
+                continue
+            results.extend(_extract_imax_shows(venue))
+    return results
 
 
-def find_movie_event_code(movies: list[dict]) -> str | None:
-    """Return the BMS event code for the target movie, or None if not found."""
+# ---------------------------------------------------------------------------
+# Strategy 2: BMS movie-list + showtimes-by-event API
+# ---------------------------------------------------------------------------
+
+def _fetch_movie_event_code() -> str | None:
+    """Fetch the BMS event code for 'Hail Mary' in the configured city."""
+    data = _bms_get(
+        "/api/explore/v1/movies",
+        params={
+            "appCode": "MOBAND2",
+            "appVersion": "14380",
+            "language": "en",
+            "status": "nowShowing,comingSoon",
+            "regionCode": CITY_CODE,
+            "city": "Bengaluru",
+        },
+    )
+    if not data:
+        return None
+
+    movies = (
+        (data.get("BookMyShow") or {}).get("arrEvents")
+        or data.get("arrEvents")
+        or (data if isinstance(data, list) else [])
+    )
     for movie in movies:
-        # BMS uses 'EventTitle' or 'EventName' depending on endpoint version
-        title = (
-            movie.get("EventTitle") or movie.get("EventName") or ""
-        ).lower()
-        code = movie.get("EventCode") or movie.get("EventId") or ""
+        title = (movie.get("EventTitle") or movie.get("EventName") or "").lower()
+        code  = movie.get("EventCode") or movie.get("EventId") or ""
         if any(kw in title for kw in MOVIE_NAME_KEYWORDS) and code:
-            log.info("Found movie: %r  code=%r", movie.get("EventTitle") or movie.get("EventName"), code)
+            log.info("explore API: found movie '%s' code=%s",
+                     movie.get("EventTitle") or movie.get("EventName"), code)
             return str(code)
     return None
 
 
-def fetch_venue_shows(event_code: str) -> list[dict]:
+def fetch_shows_by_event(event_code: str) -> list[dict]:
+    """Fetch venues + shows for a specific BMS event code on TARGET_DATE."""
+    data = _bms_get(
+        "/api/movies-data/showtimes-by-event",
+        params={
+            "appCode": "MOBAND2",
+            "appVersion": "14380",
+            "language": "en",
+            "eventCode": event_code,
+            "regionCode": CITY_CODE,
+            "subRegion": CITY_CODE,
+            "date": TARGET_DATE,
+        },
+    )
+    if not data:
+        return []
+
+    venues = (
+        data.get("ShowDetails")
+        or data.get("arrVenueDetails")
+        or data.get("Venues")
+        or []
+    )
+    results = []
+    for venue in (venues if isinstance(venues, list) else []):
+        vname = (venue.get("VenueName") or "").lower()
+        if any(kw in vname for kw in TARGET_VENUE_KEYWORDS):
+            results.extend(_extract_imax_shows(venue))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: HTML scrape of BMS venue page
+# ---------------------------------------------------------------------------
+
+def fetch_shows_via_html() -> list[dict]:
     """
-    Fetch all venues showing the movie in the city on the target date.
-    Returns a list of venue show objects.
+    Scrape the BMS city movies page HTML and look for embedded __NEXT_DATA__
+    or JSON blobs that mention Hail Mary + IMAX + Koramangala.
+    Returns list of show dicts on match.
     """
-    url = f"{BMS_BASE}/api/movies-data/showtimes-by-event"
-    params = {
-        "appCode": "MOBAND2",
-        "appVersion": "14380",
-        "language": "en",
-        "eventCode": event_code,
-        "regionCode": CITY_CODE,
-        "subRegion": CITY_CODE,
-        "bmsId": "1.21345445.1703675240",
-        "token": "67x1xa33b4x4ba0x4x5c247b0x7",
-        "date": TARGET_DATE,
-    }
-    data = _get(url, params=params)
-    if isinstance(data, dict):
-        venues = (
-            data.get("ShowDetails")
-            or data.get("arrVenueDetails")
-            or data.get("Venues")
-            or []
+    _warm_session()
+    try:
+        resp = SCRAPER.get(
+            f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+            timeout=25,
         )
-        return venues if isinstance(venues, list) else []
+        if resp.status_code not in (200, 404):
+            log.debug("HTML scrape got status %d", resp.status_code)
+            return []
+    except Exception as exc:
+        log.warning("HTML scrape request failed: %s", exc)
+        return []
+
+    text_lower = resp.text.lower()
+    has_movie  = any(kw in text_lower for kw in MOVIE_NAME_KEYWORDS)
+    has_imax   = any(kw in text_lower for kw in TARGET_FORMAT_KEYWORDS)
+    has_venue  = any(kw in text_lower for kw in TARGET_VENUE_KEYWORDS)
+
+    if has_movie and has_imax and has_venue:
+        log.info("HTML scrape: found Hail Mary + IMAX + Koramangala on BMS page!")
+        # Try to extract show times from embedded JSON (__NEXT_DATA__)
+        soup = BeautifulSoup(resp.text, "lxml")
+        next_data_tag = soup.find("script", id="__NEXT_DATA__")
+        if next_data_tag:
+            try:
+                page_data = json.loads(next_data_tag.string or "")
+                return _scan_json_for_shows(page_data)
+            except (ValueError, AttributeError):
+                pass
+        # Fallback: return a synthetic match to trigger alert
+        return [{"venue": "PVR Koramangala", "screen": "IMAX", "time": "?", "availability": "available",
+                 "booking_url": f"{BMS_BASE}/{BMS_CITY_SLUG}/movies"}]
     return []
 
 
-def check_imax_availability(venues: list[dict]) -> list[dict]:
-    """
-    Filter down to PVR Koramangala IMAX shows that have seats available.
-    Returns a list of matching show-session dicts (empty = not available yet).
-    """
-    matches = []
-    for venue in venues:
-        venue_name = (venue.get("VenueName") or venue.get("venueName") or "").lower()
+def _scan_json_for_shows(data: object, depth: int = 0) -> list[dict]:
+    """Recursively scan a JSON blob for show objects that match our criteria."""
+    if depth > 10:
+        return []
+    results = []
+    if isinstance(data, dict):
+        title = str(data.get("EventTitle") or data.get("name") or "").lower()
+        vname = str(data.get("VenueName") or data.get("venue") or "").lower()
+        fmt   = str(data.get("ScreenName") or data.get("format") or "").lower()
+        if (any(kw in title for kw in MOVIE_NAME_KEYWORDS)
+                and any(kw in vname for kw in TARGET_VENUE_KEYWORDS)
+                and any(kw in fmt   for kw in TARGET_FORMAT_KEYWORDS)):
+            results.append({
+                "venue": data.get("VenueName") or data.get("venue"),
+                "screen": data.get("ScreenName") or data.get("format"),
+                "time": data.get("ShowTime") or data.get("showTime") or "?",
+                "availability": "available",
+                "booking_url": f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+            })
+        for v in data.values():
+            results.extend(_scan_json_for_shows(v, depth + 1))
+    elif isinstance(data, list):
+        for item in data:
+            results.extend(_scan_json_for_shows(item, depth + 1))
+    return results
 
-        # Check if this is PVR Koramangala
-        if not any(kw in venue_name for kw in TARGET_VENUE_KEYWORDS):
+
+# ---------------------------------------------------------------------------
+# Shared: extract IMAX shows from a venue block
+# ---------------------------------------------------------------------------
+
+def _extract_imax_shows(venue: dict) -> list[dict]:
+    """Walk a venue dict and return all IMAX show slots."""
+    results = []
+    categories = (
+        venue.get("ShowDetails")
+        or venue.get("arrShowDetails")
+        or venue.get("Categories")
+        or []
+    )
+    if not isinstance(categories, list):
+        categories = [categories]
+
+    for cat in categories:
+        fmt = (
+            cat.get("ScreenName") or cat.get("ShowType") or cat.get("CategoryName") or ""
+        ).lower()
+        if not any(kw in fmt for kw in TARGET_FORMAT_KEYWORDS):
             continue
 
-        # Walk show categories / sessions
-        categories = (
-            venue.get("ShowDetails")
-            or venue.get("arrShowDetails")
-            or venue.get("Categories")
-            or []
-        )
-        if not isinstance(categories, list):
-            categories = [categories]
+        shows = cat.get("ShowTimes") or cat.get("arrShowTimes") or []
+        if not isinstance(shows, list):
+            shows = [shows]
 
-        for category in categories:
-            format_name = (
-                category.get("ScreenName")
-                or category.get("ShowType")
-                or category.get("CategoryName")
-                or ""
-            ).lower()
-
-            if not any(kw in format_name for kw in TARGET_FORMAT_KEYWORDS):
+        for show in shows:
+            avail = (show.get("ShowAvailability") or "A").upper()
+            # A = available, S = sold out, N = not yet bookable
+            if avail in ("S", "N"):
                 continue
-
-            shows = (
-                category.get("ShowTimes")
-                or category.get("arrShowTimes")
-                or []
-            )
-            if not isinstance(shows, list):
-                shows = [shows]
-
-            for show in shows:
-                availability = (show.get("ShowAvailability") or "").lower()
-                # BMS uses: "A" = available, "S" = sold out, "N" = not yet open
-                if availability not in ("s", "n", "sold out", "housefull"):
-                    matches.append(
-                        {
-                            "venue": venue.get("VenueName") or venue.get("venueName"),
-                            "screen": category.get("ScreenName") or category.get("ShowType"),
-                            "time": show.get("ShowTime") or show.get("showTime"),
-                            "availability": availability,
-                            "booking_url": build_booking_url(venue, show),
-                        }
-                    )
-    return matches
-
-
-def build_booking_url(venue: dict, show: dict) -> str:
-    """Construct a direct BMS booking URL for the show."""
-    venue_code = venue.get("VenueCode") or venue.get("venueCode") or ""
-    show_id = show.get("ShowId") or show.get("showId") or ""
-    if show_id:
-        return f"{BMS_BASE}/buytickets/{show_id}"
-    if venue_code:
-        return f"{BMS_BASE}/bengaluru/movies"
-    return f"{BMS_BASE}/bengaluru/movies"
+            show_id = show.get("ShowId") or show.get("showId") or ""
+            results.append({
+                "venue":        venue.get("VenueName") or venue.get("venueName"),
+                "screen":       cat.get("ScreenName") or "IMAX",
+                "time":         show.get("ShowTime") or show.get("showTime") or "?",
+                "availability": avail,
+                "booking_url":  f"{BMS_BASE}/buytickets/{show_id}" if show_id
+                                else f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+            })
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Fallback: direct venue page scrape
+# Main check orchestrator
 # ---------------------------------------------------------------------------
-
-
-def check_via_venue_page() -> bool:
-    """
-    Fallback check by fetching the BMS venue page for PVR Koramangala and
-    looking for IMAX + "Hail Mary" keywords.
-    Returns True if IMAX Hail Mary tickets appear to be listed.
-    """
-    # PVR INOX Koramangala venue code on BMS is typically BNGPVRK or similar.
-    # We do a broad search on the city movie page filtered by movie name.
-    search_url = f"{BMS_BASE}/api/movies-data/search"
-    params = {
-        "appCode": "MOBAND2",
-        "appVersion": "14380",
-        "language": "en",
-        "regionCode": CITY_CODE,
-        "query": "Hail Mary",
-    }
-    data = _get(search_url, params=params)
-    if data:
-        raw = str(data).lower()
-        if any(kw in raw for kw in MOVIE_NAME_KEYWORDS):
-            log.info("Fallback search: 'Hail Mary' found in BMS search results.")
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Main monitor loop
-# ---------------------------------------------------------------------------
-
 
 def format_alert(shows: list[dict]) -> str:
-    """Build a Telegram alert message for available shows."""
     lines = [
         "🎬 <b>IMAX Hail Mary tickets are LIVE!</b>",
-        f"📅 Friday, April 3, 2026",
-        f"📍 PVR Koramangala, Bengaluru",
+        f"📅 {DATE_LABEL}",
+        "📍 PVR Koramangala, Bengaluru",
         "",
         "<b>Available shows:</b>",
     ]
     for show in shows:
-        time_str = show.get("time") or "?"
-        screen = show.get("screen") or "IMAX"
-        url = show.get("booking_url") or BMS_BASE
-        lines.append(f"  • {screen}  {time_str}  — <a href='{url}'>Book now</a>")
+        t    = show.get("time") or "?"
+        scr  = show.get("screen") or "IMAX"
+        url  = show.get("booking_url") or BMS_BASE
+        lines.append(f"  • {scr}  {t}  — <a href='{url}'>Book now</a>")
     lines += [
         "",
-        f"🔗 <a href='https://in.bookmyshow.com/bengaluru/movies'>BookMyShow Bengaluru</a>",
+        f"🔗 <a href='{BMS_BASE}/{BMS_CITY_SLUG}/movies'>BookMyShow Bengaluru</a>",
     ]
     return "\n".join(lines)
 
 
 def run_check() -> bool:
     """
-    Run a single availability check cycle.
-    Returns True if tickets were found (caller should alert and possibly stop).
+    Run one full check cycle using all three strategies in order.
+    Returns True if available tickets were found (and alert was sent).
     """
-    log.info("Checking BMS for Hail Mary IMAX shows at PVR Koramangala on 2026-04-03…")
+    log.info("Checking BMS for Hail Mary IMAX @ PVR Koramangala on %s…", TARGET_DATE)
 
-    movies = fetch_now_showing_movies()
-    if not movies:
-        log.warning("Could not fetch movie list from BMS (movie might not be listed yet).")
-        # Try fallback
-        found_via_fallback = check_via_venue_page()
-        if found_via_fallback:
-            msg = (
-                "🎬 <b>Hail Mary</b> appears on BookMyShow!\n"
-                "📍 PVR Koramangala · IMAX · April 3, 2026\n\n"
-                "Please check manually:\n"
-                "🔗 <a href='https://in.bookmyshow.com/bengaluru/movies'>BookMyShow Bengaluru</a>"
-            )
-            send_telegram(msg)
-            return True
-        return False
-
-    event_code = find_movie_event_code(movies)
-    if not event_code:
-        log.info("'Hail Mary' not yet listed on BMS for Bengaluru.")
-        return False
-
-    venues = fetch_venue_shows(event_code)
-    if not venues:
-        log.info("No venue show data returned for event %s on %s.", event_code, TARGET_DATE)
-        return False
-
-    available = check_imax_availability(venues)
-    if available:
-        log.info("TICKETS FOUND! %d IMAX slot(s) available.", len(available))
-        send_telegram(format_alert(available))
+    # Strategy 1: QUICKBOOK
+    shows = fetch_quickbook_shows()
+    if shows:
+        log.info("TICKETS FOUND via QUICKBOOK! %d IMAX slot(s).", len(shows))
+        send_telegram(format_alert(shows))
         return True
 
-    log.info("No IMAX availability at PVR Koramangala yet.")
+    # Strategy 2: explore API + showtimes-by-event
+    event_code = _fetch_movie_event_code()
+    if event_code:
+        shows = fetch_shows_by_event(event_code)
+        if shows:
+            log.info("TICKETS FOUND via showtimes API! %d IMAX slot(s).", len(shows))
+            send_telegram(format_alert(shows))
+            return True
+        log.info("Movie found (code=%s) but no IMAX shows at PVR Koramangala yet.", event_code)
+        return False
+
+    # Strategy 3: HTML scrape
+    shows = fetch_shows_via_html()
+    if shows:
+        log.info("TICKETS FOUND via HTML scrape! Sending alert.")
+        send_telegram(format_alert(shows))
+        return True
+
+    log.info("'Hail Mary' not yet listed / no IMAX slots available. Will retry.")
     return False
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is not set. Please export it before running.")
+        log.error("TELEGRAM_BOT_TOKEN is not set.")
         sys.exit(1)
     if not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_CHAT_ID is not set. Please export it before running.")
+        log.error("TELEGRAM_CHAT_ID is not set.")
         sys.exit(1)
 
     log.info("=" * 60)
-    log.info("Hail Mary IMAX Monitor — PVR Koramangala, April 3 2026")
-    log.info("Checking every %d seconds. Ctrl-C to stop.", CHECK_INTERVAL)
+    log.info("Hail Mary IMAX Monitor — PVR Koramangala | %s", DATE_LABEL)
+    log.info("Check interval: %ds  |  Target date: %s", CHECK_INTERVAL, TARGET_DATE)
     log.info("=" * 60)
 
-    # Send a startup confirmation
     send_telegram(
-        "🤖 <b>Ticket monitor started!</b>\n"
-        "Watching for <b>Hail Mary IMAX</b> tickets at PVR Koramangala\n"
-        f"📅 April 3, 2026 · checking every {CHECK_INTERVAL}s"
+        "🤖 <b>Monitor started!</b>\n"
+        f"Watching <b>Hail Mary IMAX</b> @ PVR Koramangala\n"
+        f"📅 {DATE_LABEL} · checking every {CHECK_INTERVAL}s"
     )
 
-    alert_sent = False
     while True:
         try:
             found = run_check()
-            if found and not alert_sent:
-                alert_sent = True
-                log.info("Alert sent. Continuing to monitor in case you missed it.")
-                # Keep running so repeat alerts are sent on each check until show is found
-                # Reset after one confirmed alert to avoid spam
-                time.sleep(CHECK_INTERVAL * 5)  # longer wait after first alert
-                alert_sent = False  # reset to re-alert next cycle if still available
+            if found:
+                time.sleep(CHECK_INTERVAL * 5)   # back off after alert
             else:
                 time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             break
         except Exception as exc:
-            log.exception("Unexpected error during check: %s", exc)
+            log.exception("Unexpected error: %s", exc)
             time.sleep(CHECK_INTERVAL)
 
 
