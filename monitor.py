@@ -224,38 +224,71 @@ def fetch_quickbook_shows() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _fetch_movie_event_code() -> str | None:
-    """Fetch the BMS event code for 'Hail Mary' in the configured city."""
+    """
+    Fetch the BMS base event code for 'Project Hail Mary' by scraping the
+    explore/movies-in-bengaluru page (the /api/explore/v1/movies endpoint is 404).
+    """
+    try:
+        resp = SCRAPER.get(f"{BMS_BASE}/explore/movies-in-bengaluru", timeout=20)
+        if resp.status_code != 200:
+            log.debug("explore page returned %d", resp.status_code)
+            return None
+    except Exception as exc:
+        log.warning("explore page fetch failed: %s", exc)
+        return None
+
+    # The page embeds URLs like: /bengaluru/movies/project-hail-mary/ET00451760
+    for kw in MOVIE_NAME_KEYWORDS:
+        slug = kw.replace(" ", "-")
+        match = re.search(
+            rf'/bengaluru/movies/[^"]*{re.escape(slug)}[^"/]*/?(ET\d+)',
+            resp.text,
+            re.IGNORECASE,
+        )
+        if match:
+            code = match.group(1)
+            log.info("explore page: found movie code=%s", code)
+            return code
+    return None
+
+
+def _fetch_imax_event_code(base_event_code: str) -> str | None:
+    """
+    Query showtimes-by-event for the base event and extract the IMAX child event code
+    from the ChildEvents list in the response.
+    """
     data = _bms_get(
-        "/api/explore/v1/movies",
+        "/api/movies-data/showtimes-by-event",
         params={
             "appCode": "MOBAND2",
             "appVersion": "14380",
             "language": "en",
-            "status": "nowShowing,comingSoon",
+            "eventCode": base_event_code,
             "regionCode": CITY_CODE,
-            "city": "Bengaluru",
+            "subRegion": CITY_CODE,
+            "date": TARGET_DATE,
         },
     )
     if not data:
         return None
-
-    movies = (
-        (data.get("BookMyShow") or {}).get("arrEvents")
-        or data.get("arrEvents")
-        or (data if isinstance(data, list) else [])
-    )
-    for movie in movies:
-        title = (movie.get("EventTitle") or movie.get("EventName") or "").lower()
-        code  = movie.get("EventCode") or movie.get("EventId") or ""
-        if any(kw in title for kw in MOVIE_NAME_KEYWORDS) and code:
-            log.info("explore API: found movie '%s' code=%s",
-                     movie.get("EventTitle") or movie.get("EventName"), code)
+    show_details = data.get("ShowDetails") or []
+    if not show_details:
+        return None
+    child_events = (show_details[0].get("Event") or {}).get("ChildEvents") or []
+    for ce in child_events:
+        title = (ce.get("EventTitle") or "").lower()
+        code  = ce.get("EventCode") or ""
+        if any(kw in title for kw in TARGET_FORMAT_KEYWORDS) and code:
+            log.info("Found IMAX child event: '%s' code=%s", ce.get("EventTitle"), code)
             return str(code)
     return None
 
 
 def fetch_shows_by_event(event_code: str) -> list[dict]:
-    """Fetch venues + shows for a specific BMS event code on TARGET_DATE."""
+    """
+    Fetch venues + shows for a specific BMS event code on TARGET_DATE.
+    Actual response shape: {"ShowDetails": [{"Venues": [...], "Event": {...}}]}
+    """
     data = _bms_get(
         "/api/movies-data/showtimes-by-event",
         params={
@@ -271,17 +304,16 @@ def fetch_shows_by_event(event_code: str) -> list[dict]:
     if not data:
         return []
 
-    venues = (
-        data.get("ShowDetails")
-        or data.get("arrVenueDetails")
-        or data.get("Venues")
-        or []
-    )
+    show_details = data.get("ShowDetails") or []
+    if not show_details:
+        return []
+    venues = show_details[0].get("Venues") or []
+
     results = []
-    for venue in (venues if isinstance(venues, list) else []):
+    for venue in venues:
         vname = (venue.get("VenueName") or "").lower()
         if any(kw in vname for kw in TARGET_VENUE_KEYWORDS):
-            results.extend(_extract_imax_shows(venue))
+            results.extend(_extract_shows_from_venue(venue))
     return results
 
 
@@ -298,7 +330,7 @@ def fetch_shows_via_html() -> list[dict]:
     _warm_session()
     try:
         resp = SCRAPER.get(
-            f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+            f"{BMS_BASE}/explore/movies-in-bengaluru",
             timeout=25,
         )
         if resp.status_code not in (200, 404):
@@ -326,7 +358,7 @@ def fetch_shows_via_html() -> list[dict]:
                 pass
         # Fallback: return a synthetic match to trigger alert
         return [{"venue": "PVR Koramangala", "screen": "IMAX", "time": "?", "availability": "available",
-                 "booking_url": f"{BMS_BASE}/{BMS_CITY_SLUG}/movies"}]
+                 "booking_url": f"{BMS_BASE}/explore/movies-in-bengaluru"}]
     return []
 
 
@@ -362,7 +394,7 @@ def _scan_json_for_shows(data: object, depth: int = 0) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _extract_imax_shows(venue: dict) -> list[dict]:
-    """Walk a venue dict and return all IMAX show slots."""
+    """Walk a venue dict (QUICKBOOK format) and return all IMAX show slots."""
     results = []
     categories = (
         venue.get("ShowDetails")
@@ -396,8 +428,38 @@ def _extract_imax_shows(venue: dict) -> list[dict]:
                 "time":         show.get("ShowTime") or show.get("showTime") or "?",
                 "availability": avail,
                 "booking_url":  f"{BMS_BASE}/buytickets/{show_id}" if show_id
-                                else f"{BMS_BASE}/{BMS_CITY_SLUG}/movies",
+                                else f"{BMS_BASE}/explore/movies-in-bengaluru",
             })
+    return results
+
+
+def _extract_shows_from_venue(venue: dict) -> list[dict]:
+    """
+    Extract shows from a venue dict as returned by /api/movies-data/showtimes-by-event.
+    Response shape: {"VenueName": "...", "ShowTimes": [{"ShowDateTime": "YYYYMMDDHHSS"}]}
+    ShowDateTime is 12 digits: YYYYMMDDHHMI
+    """
+    results = []
+    venue_code = venue.get("VenueCode") or ""
+    shows = venue.get("ShowTimes") or []
+    for show in shows:
+        raw_dt = show.get("ShowDateTime") or ""
+        # Format: 202604031130 → "11:30"
+        if len(raw_dt) == 12:
+            show_time = f"{raw_dt[8:10]}:{raw_dt[10:12]}"
+        else:
+            show_time = raw_dt or "?"
+        results.append({
+            "venue":        venue.get("VenueName"),
+            "screen":       "IMAX 2D",
+            "time":         show_time,
+            "availability": "available",
+            "booking_url":  (
+                f"{BMS_BASE}/bengaluru/movies/project-hail-mary-imax-2d/{venue_code}"
+                if venue_code
+                else f"{BMS_BASE}/explore/movies-in-bengaluru"
+            ),
+        })
     return results
 
 
@@ -420,7 +482,7 @@ def format_alert(shows: list[dict]) -> str:
         lines.append(f"  • {scr}  {t}  — <a href='{url}'>Book now</a>")
     lines += [
         "",
-        f"🔗 <a href='{BMS_BASE}/{BMS_CITY_SLUG}/movies'>BookMyShow Bengaluru</a>",
+        f"🔗 <a href='{BMS_BASE}/explore/movies-in-bengaluru'>BookMyShow Bengaluru</a>",
     ]
     return "\n".join(lines)
 
@@ -439,15 +501,18 @@ def run_check() -> bool:
         send_telegram(format_alert(shows))
         return True
 
-    # Strategy 2: explore API + showtimes-by-event
-    event_code = _fetch_movie_event_code()
-    if event_code:
-        shows = fetch_shows_by_event(event_code)
+    # Strategy 2: explore page scrape → discover IMAX child event code → showtimes-by-event
+    base_code = _fetch_movie_event_code()
+    if base_code:
+        imax_code = _fetch_imax_event_code(base_code)
+        check_code = imax_code or base_code
+        shows = fetch_shows_by_event(check_code)
         if shows:
             log.info("TICKETS FOUND via showtimes API! %d IMAX slot(s).", len(shows))
             send_telegram(format_alert(shows))
             return True
-        log.info("Movie found (code=%s) but no IMAX shows at PVR Koramangala yet.", event_code)
+        log.info("Movie found (base=%s imax=%s) but no IMAX shows at PVR Koramangala yet.",
+                 base_code, imax_code)
         return False
 
     # Strategy 3: HTML scrape
